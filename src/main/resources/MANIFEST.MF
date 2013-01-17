@@ -1,0 +1,5 @@
+Manifest-Version: 1.0
+Premain-Class: com.appnexus.java.tools.SimpleProf
+SR1: ensures profiler's classes are loaded once; e.g., scala runtime installs its own classloader which would otherwise attempt to load some classes again...
+SR2: how can we parameterize class and jar name?
+Boot-Class-Path: core-tools-0.0.1-SNAPSHOT-common-assembly.jar
