@@ -1,12 +1,12 @@
 package com.appnexus.java.tools;
 
+import java.io.FileOutputStream;
 import java.io.PrintStream;
 import java.lang.instrument.ClassFileTransformer;
 import java.lang.instrument.IllegalClassFormatException;
 import java.lang.instrument.Instrumentation;
 import java.security.ProtectionDomain;
 import java.text.NumberFormat;
-import java.util.LinkedList;
 import java.util.Map;
 import java.util.Map.Entry;
 import java.util.concurrent.ConcurrentHashMap;
@@ -19,23 +19,24 @@ import org.objectweb.asm.MethodAdapter;
 import org.objectweb.asm.MethodVisitor;
 import org.objectweb.asm.Opcodes;
 
-public class SimpleProf {
-	
+//N.B. All state is global which is safe under the assumption that at most one instance of this class can be created per JVM.
+public class SimpleProf {	
 	//TODO(SR): add option to inject an alternate shutdown hook; not sure if we can rely on jvm's shutdown hook
 	//TODO(SR): catch VMDeath?
 	//TODO(SR): skip native methods
 	//TODO(SR): add thread id to method stats
 	//TODO(SR): add frame info to method stats, i.e., list of callers
-	
+	private final static PrintStream DEFAULT_OUT = System.out;
 	// whether or not to log any auxiliary messages
 	private static boolean silent; 
-	private static PrintStream out = System.out;
+	
+	private static PrintStream out = DEFAULT_OUT;
 	
 	private final static Map<String, MethodStats> STACK_AWARE_METHOD_STATS;
 	private final static int DEFAULT_MAP_SIZE = 10007;  // smallest prime > 10000
 	
-	private static final NumberFormat NUMBER_FORMAT = NumberFormat.getInstance();
-
+	private final static NumberFormat NUMBER_FORMAT = NumberFormat.getInstance();
+	
 	// black list of packages
 	// i.e., if a class name starts with any of the below prefixes, it is excluded
 	private static final String[] CLASS_BLACK_LIST = new String[] {
@@ -43,22 +44,19 @@ public class SimpleProf {
 		//N.B. do not instrument self!
 		"com.appnexus.java.tools."
 	};
+	// if the below regular expression matches a class, then it's methods are potentially eligible for instrumentation
+	private static String classWhiteList = ".*";
 	
-	// white list of packages
-	// if any of the below regular expressions matches a class, then it's potentially eligible for instrumentation
-	private static String[] CLASS_WHITE_LIST = new String[] { ".*" };
-	
-	private static String[] METHOD_WHITE_LIST = new String[] { ".*" };
+	// if the below regular expression matches a method, then the method is instrumented
+	private static String methodWhiteList = ".*";
 	
 	static class MethodStats {
 		long numInvocations;
 		long elapsedTime;
 		// used as a start time for the initial invocation 
-		// avoids allocating the stack below if there are no recursive calls
-		// (upon enterMethod aux is set to a non-negative value; upon exitMethod it's reset to -1 unless stack != null;
-		// if aux is non-negative upon enterMethod, then we know it's a recursive call since previous enterMethod was not followed by exitMethod)
-		long aux = -1; 
-		LinkedList<Long> stack;
+		long start; 
+		// used to track recursive invocations
+		int stackDepth;
 	}
 	
 	static {
@@ -101,18 +99,10 @@ public class SimpleProf {
 				stats = new MethodStats();
 				STACK_AWARE_METHOD_STATS.put(fqMethodName, stats);
 			}
-			if (stats.aux == -1) {
+			if (stats.stackDepth == 0) {
 				// non-recursive call
-				stats.aux = System.nanoTime();
-			} else {
-				// recursive call, use the stack
-				LinkedList<Long> stack = stats.stack;
-				
-				if (stack == null) {
-					stack = new LinkedList<Long>();
-					stats.stack = stack;
-				}
-				stack.push(System.nanoTime());
+				stats.start = System.nanoTime();
+				stats.stackDepth++;
 			}
 		}
 	}
@@ -122,25 +112,21 @@ public class SimpleProf {
 		
 		synchronized (fqMethodName) {
 			MethodStats stats = STACK_AWARE_METHOD_STATS.get(fqMethodName);
-			LinkedList<Long> stack = stats.stack;
 			
-			if (stack == null) {
+			if (stats.stackDepth == 1) {
 				// exit from non-recursive call
-				stats.elapsedTime += System.nanoTime() - stats.aux;
-				stats.aux = -1;
-			} else {
-				// exit from recursive call
-				stats.elapsedTime += System.nanoTime() - stack.pop();
-				
-				if (stack.isEmpty()) {
-					stats.stack = null;
-				}
+				stats.elapsedTime += System.nanoTime() - stats.start;
 			}
+			stats.stackDepth--;
 			stats.numInvocations++;
 		}
 	}
 	
-	private static void parseArguments(String args) {
+	//TODO(SR): use apache CLI parser?
+	private static void parseArguments(String args) throws Exception {
+		if (args == null) {
+			return;
+		}
 		// args is comma-delimited list of key=value pairs
 		String[] properties = args.split(",");
 		
@@ -159,15 +145,17 @@ public class SimpleProf {
 				if (key.equalsIgnoreCase("silent")) {
 					silent = Boolean.valueOf(value);
 				} else if (key.equalsIgnoreCase("classes")) {
-					CLASS_WHITE_LIST = value.split(";");
+					classWhiteList = value;
 				} else if (key.equalsIgnoreCase("methods")) {
-					METHOD_WHITE_LIST = value.split(";");
+					methodWhiteList = value;
+				} else if (key.equalsIgnoreCase("out")) {
+					out = new PrintStream(new FileOutputStream(value), true);
 				}
 			}
 		}
 	}
 
-	public static void premain(String args, Instrumentation inst) {
+	public static void premain(String args, Instrumentation inst) throws Exception {
 		parseArguments(args);
 		
 		inst.addTransformer(new ASMTransformer());
@@ -189,28 +177,20 @@ public class SimpleProf {
 							formatNanos(duration) + " : " + (count > 0 ? (formatNanos((double)duration/count)) : 0));
 					}
 				}
+				if (SimpleProf.out != SimpleProf.DEFAULT_OUT) {
+					SimpleProf.out.close();
+				}
 			}
 		});
 	}
-	
-	//TODO(SR): a more elegant implementation would count the zeroes
+
 	private static String formatNanos(double nanos) {
-		if (nanos > 1000) {
-			double micros = nanos / 1000;
-			
-			if (micros > 1000) {
-				double millis = micros / 1000;
-				
-				if (millis > 1000) {
-					double seconds = millis / 1000;
-					
-					return NUMBER_FORMAT.format(seconds) + " sec";
-				} else {
-					return NUMBER_FORMAT.format(millis) + " ms";
-				}
-			} else {
-				return NUMBER_FORMAT.format(micros) + " micros";
-			}
+		if (nanos >= 1000000000) {
+			return NUMBER_FORMAT.format(nanos / 1000000000) + " sec";
+		} else if (nanos >= 1000000) {
+			return NUMBER_FORMAT.format(nanos / 1000000) + " ms";
+		} else if (nanos >= 1000) {
+			return NUMBER_FORMAT.format(nanos / 1000) + " micros";
 		} else {
 			return NUMBER_FORMAT.format(nanos) + " ns";
 		}
@@ -224,7 +204,7 @@ public class SimpleProf {
 				String cname = slashToDot(className);
 
 				//TODO(SR): warn if a package matches boths lists?
-				if (!SimpleProf.startsWith(cname, SimpleProf.CLASS_BLACK_LIST) && SimpleProf.matches(cname, SimpleProf.CLASS_WHITE_LIST)) {
+				if (!SimpleProf.startsWith(cname, SimpleProf.CLASS_BLACK_LIST) && cname.matches(SimpleProf.classWhiteList)) {
 					ClassWriter cw = new ClassWriter(ClassWriter.COMPUTE_MAXS);
 					//TODO: do we really need to compute max stack/locals and frames?
 					logAux("Begin visiting class: " + cname);
@@ -244,22 +224,7 @@ public class SimpleProf {
 			return classfileBuffer;
 		}
 	}
-	
-	// returns true iff some r in ss | s.matches(ss)
-	static boolean matches(String s, String... ss) {
-		assert s != null;
-		
-		if (ss == null) {
-			return false;
-		}
-		for (String r : ss) {
-			if (s.matches(r)) {
-				return true;
-			}
-		}
-		return false;
-	}
-	
+
 	// returns true iff some r in ss | s.startsWith(r)
 	static boolean startsWith(String s, String... ss) {
 		assert s != null;
@@ -292,7 +257,8 @@ public class SimpleProf {
 			String methodName = name + desc; 
 			String fqMethodName = fullyQualifiedName(className, methodName);
 			
-			if (SimpleProf.matches(fqMethodName, SimpleProf.METHOD_WHITE_LIST)) {	
+			if (fqMethodName.matches(SimpleProf.methodWhiteList)) {	
+				logAux("Instrumenting " + fqMethodName);
 				return new SimpleMethodAdapter(mv, className, methodName);
 			} else {
 				return mv;
