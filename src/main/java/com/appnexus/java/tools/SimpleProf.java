@@ -173,8 +173,9 @@ public class SimpleProf {
 						long count = methodStats.numInvocations;
 						long duration = methodStats.elapsedTime;
 						//TODO: format
-						log(fqMethodName + " : " + NUMBER_FORMAT.format(count) + " : " + 
-							formatNanos(duration) + " : " + (count > 0 ? (formatNanos((double)duration/count)) : 0));
+						//log(fqMethodName + " : " + NUMBER_FORMAT.format(count) + " : " + 
+							//formatNanos(duration) + " : " + (count > 0 ? (formatNanos((double)duration/count)) : 0));
+						log(fqMethodName + "\t" + count + "\t" + duration + "\t" + (count > 0 ? ((double)duration/count) : 0));
 					}
 				}
 				if (SimpleProf.out != SimpleProf.DEFAULT_OUT) {
