@@ -1,4 +1,6 @@
-package com.appnexus.java.tools;
+package org.foobar.java.tools;
+
+import org.objectweb.asm.*;
 
 import java.io.FileOutputStream;
 import java.io.PrintStream;
@@ -6,18 +8,9 @@ import java.lang.instrument.ClassFileTransformer;
 import java.lang.instrument.IllegalClassFormatException;
 import java.lang.instrument.Instrumentation;
 import java.security.ProtectionDomain;
-import java.text.NumberFormat;
+import java.util.HashMap;
 import java.util.Map;
 import java.util.Map.Entry;
-import java.util.concurrent.ConcurrentHashMap;
-
-import org.objectweb.asm.ClassAdapter;
-import org.objectweb.asm.ClassReader;
-import org.objectweb.asm.ClassVisitor;
-import org.objectweb.asm.ClassWriter;
-import org.objectweb.asm.MethodAdapter;
-import org.objectweb.asm.MethodVisitor;
-import org.objectweb.asm.Opcodes;
 
 //N.B. All state is global which is safe under the assumption that at most one instance of this class can be created per JVM.
 public class SimpleProf {	
@@ -28,21 +21,19 @@ public class SimpleProf {
 	//TODO(SR): add frame info to method stats, i.e., list of callers
 	private final static PrintStream DEFAULT_OUT = System.out;
 	// whether or not to log any auxiliary messages
-	private static boolean silent; 
+	private static boolean silent = true;
 	
 	private static PrintStream out = DEFAULT_OUT;
 	
 	private final static Map<String, MethodStats> STACK_AWARE_METHOD_STATS;
 	private final static int DEFAULT_MAP_SIZE = 10007;  // smallest prime > 10000
-	
-	private final static NumberFormat NUMBER_FORMAT = NumberFormat.getInstance();
-	
+
 	// black list of packages
 	// i.e., if a class name starts with any of the below prefixes, it is excluded
 	private static final String[] CLASS_BLACK_LIST = new String[] {
 		"java.", "sun.", "com.apple.java", "scala.", "javax.",
 		//N.B. do not instrument self!
-		"com.appnexus.java.tools."
+		SimpleProf.class.getPackage().getName() + "."
 	};
 	// if the below regular expression matches a class, then it's methods are potentially eligible for instrumentation
 	private static String classWhiteList = ".*";
@@ -60,10 +51,7 @@ public class SimpleProf {
 	}
 	
 	static {
-		NUMBER_FORMAT.setMaximumFractionDigits(2);
-		NUMBER_FORMAT.setGroupingUsed(true);
-		// N.B. map acccess is always synchronized (on a method) except inside the shutdown hook; for that reason we need a thread-safe map
-		STACK_AWARE_METHOD_STATS = new ConcurrentHashMap<String, MethodStats>(DEFAULT_MAP_SIZE);
+		STACK_AWARE_METHOD_STATS = new HashMap<String, MethodStats>(DEFAULT_MAP_SIZE);
 	}
 	
 	protected static void logAux(String msg) {
@@ -84,14 +72,14 @@ public class SimpleProf {
 		return s.replace('.', '/');
 	}
 	
-	private final static String fullyQualifiedName(String prefix, String suffix) {
+	private static String fullyQualifiedName(String prefix, String suffix) {
 		return prefix + "." + suffix;
 	}
 	
 	public static void enterMethod(String className, String methodName) {
 		String fqMethodName = fullyQualifiedName(className, methodName);
 
-		synchronized (fqMethodName) {
+		synchronized (STACK_AWARE_METHOD_STATS) {
 			MethodStats stats = STACK_AWARE_METHOD_STATS.get(fqMethodName);
 			
 			if (stats == null) {
@@ -104,13 +92,14 @@ public class SimpleProf {
 				stats.start = System.nanoTime();
 				stats.stackDepth++;
 			}
+			stats.numInvocations++;
 		}
 	}
 
 	public static void exitMethod(String className, String methodName) {
 		String fqMethodName = fullyQualifiedName(className, methodName);
 		
-		synchronized (fqMethodName) {
+		synchronized (STACK_AWARE_METHOD_STATS) {
 			MethodStats stats = STACK_AWARE_METHOD_STATS.get(fqMethodName);
 			
 			if (stats.stackDepth == 1) {
@@ -118,7 +107,6 @@ public class SimpleProf {
 				stats.elapsedTime += System.nanoTime() - stats.start;
 			}
 			stats.stackDepth--;
-			stats.numInvocations++;
 		}
 	}
 	
@@ -162,19 +150,14 @@ public class SimpleProf {
 		// add shutdown hook
 		Runtime.getRuntime().addShutdownHook(new Thread() {
 			public void run() {
-				log("Dumping stats: ");
-				log("=======================================");
-
 				for (Entry<String, MethodStats> e : STACK_AWARE_METHOD_STATS.entrySet()) {
 					String fqMethodName = e.getKey();
 					
-					synchronized(fqMethodName) {
+					synchronized(STACK_AWARE_METHOD_STATS) {
 						MethodStats methodStats = e.getValue();
 						long count = methodStats.numInvocations;
 						long duration = methodStats.elapsedTime;
-						//TODO: format
-						//log(fqMethodName + " : " + NUMBER_FORMAT.format(count) + " : " + 
-							//formatNanos(duration) + " : " + (count > 0 ? (formatNanos((double)duration/count)) : 0));
+
 						log(fqMethodName + "\t" + count + "\t" + duration + "\t" + (count > 0 ? ((double)duration/count) : 0));
 					}
 				}
@@ -185,18 +168,6 @@ public class SimpleProf {
 		});
 	}
 
-	private static String formatNanos(double nanos) {
-		if (nanos >= 1000000000) {
-			return NUMBER_FORMAT.format(nanos / 1000000000) + " sec";
-		} else if (nanos >= 1000000) {
-			return NUMBER_FORMAT.format(nanos / 1000000) + " ms";
-		} else if (nanos >= 1000) {
-			return NUMBER_FORMAT.format(nanos / 1000) + " micros";
-		} else {
-			return NUMBER_FORMAT.format(nanos) + " ns";
-		}
-	}
-	
 	private static class ASMTransformer implements ClassFileTransformer, Opcodes {
 
 		public byte[] transform(ClassLoader loader, String className, Class<?> classBeingRedefined, ProtectionDomain protectionDomain,
@@ -277,7 +248,7 @@ public class SimpleProf {
 		}
 
 		public void visitCode() {
-			// prepend: enterMethod(Thread.currentThread().getId(), className, methodName);
+			// prepend: enterMethod(className, methodName);
 			this.visitLdcInsn(className);
 			this.visitLdcInsn(methodName);
 			this.visitMethodInsn(INVOKESTATIC, dotToSlash(SimpleProf.class.getName()), "enterMethod",
@@ -295,12 +266,17 @@ public class SimpleProf {
 			case Opcodes.LRETURN:
 			case Opcodes.RETURN:
 			case Opcodes.ATHROW:
-				// append: exitMethod(Thread.currentThread().getId(), className, methodName);
+				// append: exitMethod(className, methodName);
 				this.visitLdcInsn(className);
 				this.visitLdcInsn(methodName);
 				this.visitMethodInsn(INVOKESTATIC, dotToSlash(SimpleProf.class.getName()), "exitMethod",
 						"(Ljava/lang/String;Ljava/lang/String;)V");
 				break;
+				/* CAPTURE field updates to identify state mutating methods
+			case Opcodes.PUTFIELD:
+			case Opcodes.PUTSTATIC:
+			    this.visitFieldInsn(arg0, arg1, arg2, arg3);
+			    */
 			default:
 				break;
 			}
